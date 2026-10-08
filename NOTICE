@@ -1,0 +1,7 @@
+Owner-authored experimental implementation and public adaptation, copyright 2026 moruku36.
+AI assistance was used in implementation, review and documentation.
+This export uses Python standard-library modules; Python is not redistributed here.
+No Mattermost server code, OpenAI SDK, tunnel binary or third-party implementation is bundled.
+Mattermost, OpenAI and Dots are names of their respective products. This is an independent PoC,
+not an official product or endorsement. Protocol and product documentation is linked, not copied.
+The original local supervisor, credential material, private history and raw live evidence are excluded.

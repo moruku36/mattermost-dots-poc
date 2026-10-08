@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+runtime/
+*.sqlite
+*.sqlite-*
+*.log
+*.protected
+.venv/
