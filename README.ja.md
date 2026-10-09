@@ -2,9 +2,9 @@
 
 [English](README.md) · [構成](docs/architecture.md) · [導入手順](docs/setup.md)
 
-**MattermostでOpenAI Dotsを使う**ための実験的なadd-onです。最初の一歩として、承認した1チャンネルを5秒ごとにRESTで読み、新着投稿のメタデータをMCP Eventsへ渡して、購読済みChatGPT会話を起こす経路を作りました。
+**MattermostでOpenAI Dotsを使う**ための実験的なadd-onです。最初の一歩として、認証済みMattermost WebSocketの `posted` を受信し、承認した1チャンネルの新着投稿メタデータをMCP Eventsへ渡して、購読済みChatGPT会話を起こす経路を作りました。
 
-現状は新着通知だけです。**双方向の会話・自動返信・Mattermostへの書込み・常時運転は未実装**です。Mattermost側はREST pollingであり、native pushではありません。HTTP応答に本文が一時的に含まれる可能性はありますが、イベントとして保存・配送するのは `channel_id`・`post_id`・`created_ms` の3項目だけです。
+現状は新着通知だけです。**双方向の会話・自動返信・Mattermostへの書込み・常時運転は未実装**です。Mattermost側はWebSocket pushです。tokenが閲覧できる他チャンネルのイベントや本文が受信メモリに一時的に含まれますが、他チャンネルを除外し、イベントとして保存・配送するのは `channel_id`・`post_id`・`created_ms` の3項目だけです。
 
 ## 確認したこと
 
@@ -14,22 +14,24 @@
 
 ## 最初に試す
 
-Python 3.11以上、標準ライブラリのみです。
+Python 3.11以上と、バージョンを固定したWebSocket依存ライブラリを使います。
 
 ```sh
+python -m pip install -r requirements.txt
 python -B -m unittest discover -s tests -v
 python demo.py
 ```
 
-demoは架空ID・仮時計・一時DB・`.invalid`のcallback fixtureだけを使います。HTTP通信、Mattermost読取り、ChatGPT接続、投稿は実行しません。Windows以外ではDPAPI等のWindows専用テストをskipします。
+demoは架空ID・仮時計・一時DB・`.invalid`のcallback fixtureだけを使います。demoはHTTP通信、Mattermost接続、ChatGPT接続、投稿を実行しません。テストには合成のloopback WebSocket通信も含みます。Windows以外ではDPAPI等のWindows専用テストをskipします。
 
 live用テンプレートはWindows専用です。callback URLと署名情報の保管にDPAPIを使います。別途、本人が承認したMCP tunnel/hostと、MCP Eventsを利用できるChatGPT workspaceが必要です。tunnel client・pluginのインストール・公開hosting・workspace認証はこのrepoに含めていません。[導入手順](docs/setup.md)を参照してください。
 
 ## 範囲
 
-- 1チャンネル・1購読・最大5分・読取り60回・unique event 5件・配送は各3回まで。
-- discoveryだけではpollingしません。購読とcallback検証の成功後に開始します。
-- 有効期限の延長、履歴の追加取得、完全なreplayは提供しません。新着だけでページ上限に達した場合はgapの可能性として停止します。
+- 1チャンネル・1購読・最大5分・接続試行3回（初回＋再接続最大2回）・unique event 5件・配送は各3回まで。
+- discoveryだけでは接続しません。購読とcallback検証の成功後に開始します。
+- 有効期限の延長、履歴の追加取得、完全なreplayは提供しません。切断があればgapの可能性を結果に残し、1秒・2秒の待機で有限の再接続を行います。期限と重複排除・5件上限は引き継ぎます。
+- 受信は最大1000メッセージ、各64 KiB。認証・redirect・TLS・protocolエラーでは停止します。プロセス再起動では購読を復帰させず、callback情報を消去します。
 - 常時運転、再起動後の安全な継続、完全履歴、配送SLO、production readinessは保証しません。
 - token自体の権限を狭くしてください。コードのチャンネル制限だけでは、tokenのサーバー側権限は狭まりません。
 - 公開版は元のSID/hash付き監督部を含みません。本人プロセスの環境変数でtokenを受け取ります。認証なしで外部公開せず、秘密を環境ファイル・ログ・画面共有に出さないでください。同一ユーザーや管理者からの完全な隔離は保証しません。

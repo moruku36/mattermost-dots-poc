@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from notification_core import CHANNEL, Refused
 from protected_delivery import Dpapi, callback_target, public_addresses, ProtectedHTTPS
-from source_scope import metadata, Poller
+from source_scope import posted_metadata
 
 
 def source_result(posts=None):
@@ -27,7 +27,7 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)
             (run/'session.json').write_text(json.dumps({'native_events_approved':True,
-                'owner':OWNER,'channel':CHANNEL,'max_reads':60,'max_posts':5,
+                'owner':OWNER,'channel':CHANNEL,'source_mode':'websocket','max_connections':3,'max_posts':5,
                 'seconds':300,'policy':'public-fixture-policy'}))
             service=native_service.Service(run)
             for reason in SCOPE_REASONS:
@@ -38,7 +38,32 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual({'FAIL_'+reason:1 for reason in SCOPE_REASONS},counts)
             self.assertNotIn('synthetic-private',json.dumps(counts))
             self.assertIsNone(service.events)
-            self.assertIsNone(service.poller)
+            self.assertIsNone(service.source)
+
+    def test_process_restart_refuses_resume_and_clears_callback_state(self):
+        import native_service
+        from public_runtime import OWNER
+        from mcp_events_candidate import Events, FixtureTransport
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / 'session.json').write_text(json.dumps({'native_events_approved': True,
+                'owner': OWNER, 'channel': CHANNEL, 'source_mode': 'websocket',
+                'max_connections': 3, 'max_posts': 5, 'seconds': 300}))
+            events = Events(run / 'events.protected.sqlite', trial_deadline=time.time() + 300,
+                transport=FixtureTransport(lambda *a: None), authorized=lambda *a: True)
+            events.db.execute("INSERT INTO subscriptions(id,owner,url,secret,active,count) VALUES ('fixture','fixture','fixture','fixture',1,0)")
+            events.db.commit()
+            events.close()
+            (run / 'native-started.json').write_text('{}')
+            with patch.object(native_service, 'connect_source') as connect:
+                service = native_service.Service(run)
+                self.assertTrue(service.disabled)
+                self.assertIsNone(service.worker)
+                connect.assert_not_called()
+            import sqlite3
+            with sqlite3.connect(run / 'events.protected.sqlite') as db:
+                self.assertEqual((0, None, None), db.execute('SELECT active,url,secret FROM subscriptions').fetchone())
+            db.close()
 
     def test_callback_url_scope(self):
         for url in ('http://example.com/cb', 'https://u:p@example.com/cb', 'https://example.com:8080/cb',
@@ -66,62 +91,8 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaises(Refused):
             protector.open(public)
 
-    def test_metadata_body_discard_and_wrong_channel(self):
-        post = {'channel_id': CHANNEL, 'id': 'a' * 26, 'create_at': 1000,
-                'message': 'untrusted body secret must never leave source memory', 'user_id': 'private-user'}
-        extracted = metadata(source_result([post]), 900)
-        self.assertEqual([{'channel_id': CHANNEL, 'post_id': 'a' * 26, 'created_ms': 1000}], extracted)
-        self.assertNotIn('message', json.dumps(extracted))
-        self.assertEqual([], metadata(source_result([post]), 1001))
-        with self.assertRaises(Refused):
-            metadata(source_result([post | {'channel_id': 'other'}]), 0)
-
-    def test_full_page_possible_gap_stops_without_history(self):
-        posts = [{'channel_id': CHANNEL, 'id': chr(97 + i) * 26, 'create_at': 1000} for i in range(5)]
-        with self.assertRaisesRegex(Refused, 'SOURCE_POSSIBLE_GAP'):
-            metadata(source_result(posts), 900)
-
-    def test_poll_prepared_idle_and_exact_sixty_five_seconds(self):
-        now, calls = [1000.0], []
-        poll = Poller(lambda args, deadline: calls.append((now[0], args, deadline)) or source_result(),
-                      lambda _: None, lambda: None, clock=lambda: now[0],
-                      wait=lambda seconds: now.__setitem__(0, now[0] + seconds))
-        self.assertEqual([], calls)  # constructing candidate starts no monitoring
-        poll.run()
-        self.assertEqual(60, len(calls))
-        self.assertTrue(all(x[1] == {'channel_id': CHANNEL, 'limit': 5} for x in calls))
-        self.assertEqual(5, calls[1][0] - calls[0][0])
-        self.assertEqual(1300, now[0])
-
-    def test_poll_restart_keeps_count_deadline_interval(self):
-        now, calls = [1000.0], []
-        with tempfile.TemporaryDirectory() as d:
-            path = Path(d) / 'public-budget.sqlite'
-            first = None
-            def interrupted_wait(seconds):
-                first.stop.set()
-            first = Poller(lambda *args: calls.append(now[0]) or source_result(), lambda _: None, lambda: None,
-                           clock=lambda: now[0], wait=interrupted_wait, state_path=path, started=1000, deadline=1300)
-            first.run()
-            self.assertEqual(1, first.reads)
-            second = Poller(lambda *args: calls.append(now[0]) or source_result(), lambda _: None, lambda: None,
-                clock=lambda: now[0], wait=lambda seconds: now.__setitem__(0, now[0] + seconds),
-                state_path=path, started=1000, deadline=1300)
-            second.run()
-            self.assertEqual(60, second.reads)
-            self.assertEqual(60, len(calls))
-            self.assertEqual(1005, calls[1])
-
-    def test_failed_poll_consumes_attempt_and_stops(self):
-        def failed(*_):
-            raise RuntimeError('fixture failure; no raw body logged')
-        poll = Poller(failed, lambda _: None, lambda: None)
-        poll.run()
-        self.assertEqual(1, poll.reads)
-        self.assertEqual('SOURCE_STOPPED_SAFELY', poll.outcome)
-
     @unittest.skipUnless(os.name == 'nt', 'native supervisor Windows-only')
-    def test_native_service_discovery_no_poll_subscription_dummy_tls_cleanup(self):
+    def test_native_service_discovery_no_connection_subscription_dummy_tls_cleanup(self):
         import native_service
         from public_runtime import OWNER
         from mcp_events_candidate import PROTOCOL
@@ -137,13 +108,31 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             run = Path(d)
             (run / 'session.json').write_text(json.dumps({'native_events_approved': True, 'owner': OWNER,
-              'channel': CHANNEL, 'max_reads': 60, 'max_posts': 5, 'seconds': 300, 'policy': 'public-fixture-policy'}))
+              'channel': CHANNEL, 'source_mode': 'websocket', 'max_connections': 3, 'max_posts': 5, 'seconds': 300, 'policy': 'public-fixture-policy'}))
             reads = []
-            def read(*args):
+            class FixtureSocket:
+                sent = False
+                hello = False
+                closed = False
+                def recv(self, timeout):
+                    if not self.hello:
+                        self.hello = True
+                        return json.dumps({'event': 'hello'})
+                    if not self.sent:
+                        self.sent = True
+                        return json.dumps({'event': 'posted', 'broadcast': {'channel_id': CHANNEL},
+                            'data': {'post': json.dumps({'channel_id': CHANNEL, 'id': 'b' * 26,
+                                'create_at': int(time.time() * 1000), 'message': 'fixture body'})}})
+                    time.sleep(timeout)
+                    raise TimeoutError()
+                def close(self):
+                    self.closed = True
+            source = FixtureSocket()
+            def connect(*args):
                 reads.append(1)
-                return source_result([{'channel_id': CHANNEL, 'id': 'a' * 26, 'create_at': int(time.time() * 1000), 'message': 'fixture body'}])
+                return source
             with patch.object(native_service, 'preflight', lambda: 'public-fixture-policy'), \
-                 patch.object(native_service, 'existing_backend', read), patch.object(ProtectedHTTPS, 'post', callback):
+                 patch.object(native_service, 'connect_source', connect), patch.object(ProtectedHTTPS, 'post', callback):
                 service = native_service.Service(run)
                 try:
                     request = {'jsonrpc': '2.0', 'id': 1, 'method': 'server/discover'}
@@ -161,6 +150,7 @@ class PreparationTests(unittest.TestCase):
                     service.finish()
                 self.assertEqual(1, len(reads))
                 self.assertFalse(service.worker.is_alive())
+                self.assertTrue(source.closed)
                 self.assertNotIn(key.encode(), (run / 'events.protected.sqlite').read_bytes())
                 summary = json.loads((run / 'native-result.json').read_text())
                 self.assertTrue(summary['callback_secrets_cleared'])

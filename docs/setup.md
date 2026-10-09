@@ -2,9 +2,10 @@
 
 ## Offline reproduction (recommended first)
 
-Use Python 3.11+ from the repository directory. No pip install is needed.
+Use Python 3.11+ from the repository directory. Install the pinned WebSocket dependency in a local virtual environment.
 
 ```sh
+python -m pip install -r requirements.txt
 python -B -m unittest discover -s tests -v
 python demo.py
 ```
@@ -18,9 +19,9 @@ This path is provided for review/adaptation. It has **not been live-tested with 
 Requirements:
 
 1. A Windows owner account with Python 3.11+, and one approved Mattermost channel containing synthetic test posts only.
-2. A dedicated least-privilege Mattermost token. This code makes only a fixed-channel GET; token privileges must be restricted independently on the server.
+2. A dedicated least-privilege Mattermost token. This code accepts only the approved channel from an authenticated WebSocket; token privileges must be restricted independently on the server.
 3. A ChatGPT workspace/client supporting [MCP Events](https://developers.openai.com/plugins/build/mcp-events), an installed authorized plugin or MCP connection, and an authenticated tunnel/host capable of launching a local stdio server. These services and their configuration are **not bundled**. Follow their official setup instructions; do not expose this stdio service through an unauthenticated HTTP wrapper.
-4. Explicit permission for source polling and outbound event delivery. Use only a receiver-generated callback URL/signing secret. Do not put either in source or a static example.
+4. Explicit permission for authenticated WebSocket reception (including transient events visible to the existing token) and outbound event delivery. Use only a receiver-generated callback URL/signing secret. Do not put either in source or a static example.
 
 Set **only in your owner process** the names in [.env.example](../.env.example): `MM_CHANNEL_ID`, `MM_BASE_URL` (HTTPS origin), `MM_TOKEN` and `MM_TRIAL_APPROVED=YES`. The application does not read a `.env` file. Never paste a token into a chat, commit it, pass it as a command argument, or publish terminal logs. Any secret-manager/tunnel process must pass the same narrowly scoped environment to its child. Environment variables are not absolute protection from same-user/admin programs.
 
@@ -36,15 +37,15 @@ Configure the authorized MCP host's child command as `python -B native_service.p
 
 The transport identity in this template is the constant `local-owner`; it is not OAuth, a Windows SID check, or multi-user authorization. Only launch it inside an already authenticated single-owner transport. The private supervisor's SID/pin/ACL checks are not part of this public template.
 
-Ask the connected ChatGPT conversation to subscribe to `message.created` for the approved channel with a TTL of at most 300000 ms and an appropriate notification instruction. Discovery alone performs no source polling. Once the client verifies the callback and subscribes, the source polls every five seconds. During that bounded window, create one synthetic post **manually** in the approved channel. This service never creates a Mattermost post or reply.
+Ask the connected ChatGPT conversation to subscribe to `message.created` for the approved channel with a TTL of at most 300000 ms and an appropriate notification instruction. Discovery alone opens no source connection. Once the client verifies the callback and subscribes, the source connects to `/api/v4/websocket` using WSS and the existing token in an Authorization header. The authenticated `hello` must arrive within five seconds before posts are accepted. During that bounded window, create one synthetic post **manually** in the approved channel. This service never creates a Mattermost post or reply.
 
-Check the resulting conversation wake yourself. Do not publish actual post/channel IDs or callback data. At expiry or successful active unsubscribe, source polling stops and subscription callback/signing values are cleared. Then disconnect/stop the authorized MCP child to end the process and release its environment-held source token. Local runtime metadata may remain; dispose of it under your own data-retention policy.
+Check the resulting conversation wake yourself. Do not publish actual post/channel IDs or callback data. At expiry or successful active unsubscribe, the WebSocket closes and subscription callback/signing values are cleared. Then disconnect/stop the authorized MCP child to end the process and release its environment-held source token. Local runtime metadata may remain; dispose of it under your own data-retention policy.
 
 ## Important limits
 
 - No auto-start, service installation, provider/key enrollment, tunnel launch, paid API use or package installation is performed by these commands.
-- Up to 60 source reads and 5 unique events; 3 delivery attempts each. A source failure or possible full-page gap stops the monitor.
-- Restart behavior exists only as experimental code and has not been verified as a reliable recovery guarantee. No always-on use, history replay, complete history or two-way conversation.
+- Up to 3 source connection attempts and 5 unique events; 3 delivery attempts each. Disconnects retain a possible-gap flag and retry after 1s/2s without extending the original deadline. Fatal auth/redirect/TLS/protocol errors stop the source. There is no history fetch or REST fallback. At most 1000 source messages of 64 KiB each are accepted.
+- A process restart refuses to resume a started trial and clears protected callback/signing values. Prepare a new trial only with renewed owner authorization; there is no restart recovery guarantee. No always-on use, history replay, complete history or two-way conversation.
 - Callback delivery is HTTPS-only, validates public DNS destinations at connection time, retains TLS hostname verification, and follows no redirects. The source HTTPS origin is explicitly owner-configured; it may be a private Mattermost server authorized by that owner.
 - This repo's JSON-RPC errors/diagnostic files use fixed categories and counters. The surrounding host/tunnel still needs a logging policy that does not record credentials or callback params.
 

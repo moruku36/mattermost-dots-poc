@@ -1,6 +1,7 @@
 Owner-authored experimental implementation and public adaptation, copyright 2026 moruku36.
 AI assistance was used in implementation, review and documentation.
-This export uses Python standard-library modules; Python is not redistributed here.
+This export uses Python standard-library modules and the external websockets dependency
+(BSD-3-Clause, https://github.com/python-websockets/websockets). Neither is redistributed here.
 No Mattermost server code, OpenAI SDK, tunnel binary or third-party implementation is bundled.
 Mattermost, OpenAI and Dots are names of their respective products. This is an independent PoC,
 not an official product or endorsement. Protocol and product documentation is linked, not copied.
