@@ -1,79 +1,63 @@
-"""Offline public-adapter contracts; all HTTP and environment values are synthetic."""
+"""Synthetic adapter contracts; no real credential or source connection."""
 import json
-import time
 import unittest
 from unittest.mock import patch
-
-from notification_core import CHANNEL, Refused
 import public_runtime
+from notification_core import CHANNEL, Refused
 
 
 class Connection:
-    def __init__(self, status, data):
-        self.status, self.data = status, data
-        self.calls = []
-        self.closed = False
-
-    def request(self, method, path, **kwargs):
-        self.calls.append((method, path, kwargs))
-
-    def getresponse(self):
-        return self
-
-    def read(self, size):
-        return self.data[:size]
-
+    def recv(self, timeout):
+        return '{"event":"hello"}'
     def close(self):
         self.closed = True
 
 
 class PublicRuntimeTests(unittest.TestCase):
-    def invoke(self, connection, arguments=None):
+    def test_fixed_wss_header_bounds_tls_no_logs_or_proxy(self):
+        calls = []
+        connection = Connection()
         with patch.object(public_runtime, 'preflight', lambda: None), \
              patch.dict(public_runtime.os.environ, {'MM_BASE_URL': 'https://source.example.invalid',
                                                     'MM_TOKEN': 'public-fixture-token-not-real'}), \
-             patch.object(public_runtime.http.client, 'HTTPSConnection', lambda *a, **k: connection):
-            return public_runtime.existing_backend(arguments or {'channel_id': CHANNEL, 'limit': 5},
-                                                   {'deadline': time.time() + 10})
-
-    def test_get_only_and_body_fields_are_discarded(self):
-        ident = 'b' * 26
-        post = {'id': ident, 'channel_id': CHANNEL, 'create_at': 1000,
-                'message': 'PRIVATE_BODY_FIXTURE', 'user_id': 'PRIVATE_AUTHOR_FIXTURE'}
-        connection = Connection(200, json.dumps({'order': [ident], 'posts': {ident: post}}).encode())
-        result = self.invoke(connection)
+             patch('websockets.sync.client.connect', lambda *a, **k: calls.append((a, k)) or connection):
+            source = public_runtime.connect_source(3)
+        args, kwargs = calls[0]
+        self.assertEqual(('wss://source.example.invalid/api/v4/websocket',), args)
+        self.assertEqual({'Authorization': 'Bearer public-fixture-token-not-real'}, kwargs['additional_headers'])
+        self.assertEqual(3, kwargs['open_timeout'])
+        self.assertEqual(65536, kwargs['max_size'])
+        self.assertEqual(4, kwargs['max_queue'])
+        self.assertIsNone(kwargs['proxy'])
+        self.assertIsNone(kwargs['compression'])
+        self.assertTrue(kwargs['ssl'].check_hostname)
+        self.assertTrue(kwargs['logger'].disabled)
+        self.assertFalse(kwargs['logger'].propagate)
+        self.assertEqual('{"event":"hello"}', source.recv(0.1))
+        source.close()
         self.assertTrue(connection.closed)
-        self.assertEqual('GET', connection.calls[0][0])
-        self.assertEqual('/api/v4/channels/' + CHANNEL + '/posts?page=0&per_page=5', connection.calls[0][1])
-        self.assertNotIn('PRIVATE_BODY_FIXTURE', json.dumps(result))
-        self.assertNotIn('PRIVATE_AUTHOR_FIXTURE', json.dumps(result))
-        payload = json.loads(result['content'][0]['text'])
-        self.assertEqual([{'id': ident, 'channel_id': CHANNEL, 'create_at': 1000}], payload['posts'])
 
-    def test_wrong_channel_refused_before_request(self):
-        connection = Connection(200, b'{}')
-        with self.assertRaises(Refused):
-            self.invoke(connection, {'channel_id': 'not-approved', 'limit': 5})
-        self.assertEqual([], connection.calls)
+    def test_redirect_and_auth_failure_refused_without_reconnect(self):
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response
+        from websockets.datastructures import Headers
+        for code in (302, 401, 403):
+            with patch.object(public_runtime, 'preflight', lambda: None), \
+                 patch.dict(public_runtime.os.environ, {'MM_BASE_URL': 'https://source.example.invalid', 'MM_TOKEN': 'fixture'}), \
+                 patch('websockets.sync.client.connect', side_effect=InvalidStatus(Response(code, 'fixture', Headers()))) as connect:
+                with self.assertRaisesRegex(Refused, 'SOURCE_HANDSHAKE_REFUSED'):
+                    public_runtime.connect_source(3)
+                self.assertEqual(1, connect.call_count)
 
-    def test_redirect_error_and_oversize_are_refused(self):
-        for status, data in [(302, b'{}'), (401, b'{}'), (200, b'x' * 65537)]:
-            connection = Connection(status, data)
+    def test_protocol_oversize_close_is_fatal(self):
+        from websockets.exceptions import ConnectionClosedError
+        from websockets.frames import Close
+        connection = Connection()
+        with patch.object(connection, 'recv', side_effect=ConnectionClosedError(Close(1009, 'fixture'), None, None)):
             with self.assertRaises(Refused):
-                self.invoke(connection)
-            self.assertTrue(connection.closed)
-
-    def test_more_than_five_or_wrong_scope_refused(self):
-        for data in [{'order': ['b'] * 6, 'posts': {}},
-                     {'order': ['b'], 'posts': {'b': {'id': 'b', 'channel_id': 'other'}}}]:
-            with self.assertRaises(Refused):
-                self.invoke(Connection(200, json.dumps(data).encode()))
+                public_runtime.SourceSocket(connection).recv(0.1)
 
     def test_default_preflight_refuses_without_secret_or_approval(self):
         with patch.dict(public_runtime.os.environ, {}, clear=True):
             with self.assertRaises(Refused):
                 public_runtime.preflight()
-
-
-if __name__ == '__main__':
-    unittest.main()
