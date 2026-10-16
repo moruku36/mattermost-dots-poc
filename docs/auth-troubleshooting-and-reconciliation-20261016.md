@@ -33,9 +33,11 @@ All findings are documented using non-secret identifiers, generalized environmen
 The local replacement candidate introduces `replace_credential()` and `WindowsStore.replace_credential_and_policy()` adhering to the following strict safety conditions:
 
 1. **Explicit Confirmation**: Requires explicit confirmation (`confirm_replace=True` / `--replace-expired`) in addition to an interactive masked terminal session.
-2. **Process Cessation Attestation (Fail-Closed Default)**:
-   - To prevent race conditions or concurrent child process access, replacement requires a callable `poc_stopped_attestation` returning `True`.
-   - *Current Status*: Because an external OS-level process cessation attestation interface is not yet linked in the CLI path, `poc_stopped_attestation` defaults to `None` and fails closed (`POC_STOP_UNVERIFIED_REFUSED`).
+2. **Process Cessation Attestation via Shared Trial Lock & Runtime Receipts (`hold_poc_stop_lock` / `verify_poc_runtime_stopped`)**:
+   - Instead of relying on process names, window titles, or user self-reports, the replacement candidate connects to the existing PoC lifecycle synchronization primitives:
+     - **Exclusive Byte-Range Lock**: Acquires and holds the non-blocking OS byte-range lock (`msvcrt.locking(..., msvcrt.LK_NBLCK, 1)` at offset 0) on the existing shared `trial.lock` file for the entire duration of `replace_credential()`. If `trial.lock` is missing, is a reparse point, or is currently locked by a running trial, replacement fails closed (`POC_STOP_UNVERIFIED_REFUSED`).
+     - **Quarantine Marker Check**: Verifies before and after lock acquisition that `trial.lock.blocked` (`LOCAL_CLEANUP_UNCONFIRMED`) does not exist.
+     - **Runtime Completion Receipt Verification**: Inspects the PoC runtime directories (`run-poc-*` and `run-*`) while holding `trial.lock`, requiring that at least one runtime root exists and every existing run subdirectory has completed with confirmed stop receipts (`poc-owner-result.json` / `poc-tunnel-result.json` with `source_job_stopped: true` and `callback_values_cleared: true`, `poc-tunnel-diagnostic.json` at `stage: "WRITE_RESULT_DONE"` and `confirmation: "TRUE"`, no `.pending` diagnostic file, and `trial-result.json` for legacy trial runs).
 3. **Revocation & Owner Verification**: Rejects replacement if the `revoked` marker exists or if the new policy owner does not match the existing stored policy owner.
 4. **Objective Cryptographic & Expiry Verification (`verify_payload` Alignment)**:
    - In `verify_payload()`, timestamp expiry (`if expires <= now: raise Denied("Credential expired; store a new one")`) is evaluated after JSON schema, version, SID, owner, `policy_sha256`, and lifetime checks, and immediately before `validate_token()`.
@@ -52,15 +54,21 @@ The local replacement candidate introduces `replace_credential()` and `WindowsSt
 
 ## 4. Verification & Testing Boundaries
 
-* **Synthetic 6-Path Verification (In-Memory Fake Store/DPAPI/ACL)**:
+* **Synthetic 6-Path Replacement & Rollback Verification (In-Memory Fake Store/DPAPI/ACL)**:
   1. Missing explicit confirmation (`confirm_replace=False`) -> refused (`CONFIRMATION_REQUIRED`), original 2 files preserved.
   2. Unverified or false process stop attestation (`None` / `False`) -> refused (`POC_STOP_UNVERIFIED_REFUSED`), original 2 files preserved.
   3. Owner mismatch, `revoked` marker present, or tampered payload token -> refused, original 2 files preserved.
   4. Unexpired existing credential (`now < expires_at`) -> refused (`Existing credential has not expired yet`), original 2 files preserved.
   5. Expired valid credential with matching owner, valid SID/digest, and stop attestation -> replaced and post-verified successfully.
   6. Failure injected on the 2nd `os.replace` (after `policy.json` was already replaced) and failure injected during post-replacement `verify_after` -> automatic `.bak` rollback restored both `policy.json` and `credential.bin` to exact original bytes.
+* **Synthetic 4-Path Stop-Lock & Runtime Receipt Differential Verification**:
+  1. Missing or busy `trial.lock` -> refused (`shared trial lock is missing` / `shared trial lock is busy`), original 2 files preserved.
+  2. Quarantine marker `trial.lock.blocked` present -> refused (`shared trial lock is blocked`), original 2 files preserved.
+  3. Active/incomplete `run-poc-*` (missing `poc-tunnel-result.json` / `poc-owner-result.json`) or missing runtime directories -> refused (`active or unconfirmed trial state` / `runtime state unavailable`), original 2 files preserved.
+  4. Available `trial.lock`, no `.blocked`, and confirmed `run-poc-*` receipts -> lock held throughout both `_replacer` file writes (`[True, True]`) and released in `finally`.
 * **Strict Safety Boundaries Maintained**:
-  * Real DPAPI / credential store / filesystem: untouched during synthetic testing.
+  * Real DPAPI / credential store / lock files / filesystem: untouched during synthetic testing.
   * Real PAT / tokens: never input, read, printed, or logged.
-  * External process stop attestation & live WebSocket/network connection: unlinked and unexecuted.
+  * Live WebSocket / network connection: unexecuted.
+
 
