@@ -28,22 +28,39 @@ All findings are documented using non-secret identifiers, generalized environmen
 
 ## 3. Safe Credential Replacement Architecture
 
-The new candidate introduces `replace_credential()` adhering to the following strict safety conditions:
+> **Scope Note**: This public pull request records only the non-secret architecture, root-cause analysis, and synthetic verification results. The executable replacement candidate code (`windows_pat_candidate.py`) is maintained exclusively in an isolated local candidate directory outside the public repository.
 
-1. **Explicit Confirmation**: Requires both command-line confirmation (`--replace-expired`) and an interactive masked session.
-2. **Owner Verification**: Validates that the newly presented policy owner exactly matches the existing stored policy owner.
-3. **Objective Expiration Verification**: Checks the internal cryptographic expiration timestamp of the existing DPAPI payload. Self-reported expiration is rejected. If the existing credential is still valid, replacement is refused (`CREDENTIAL_STILL_VALID`).
-4. **Process Cessation Attestation (Current Blocker)**:
-   - To prevent race conditions or simultaneous child process usage, credential replacement must objectively verify that no running adapter process is accessing the store.
-   - *Current Implementation Status*: Because an external OS-level process cessation attestation interface is not yet linked in the local environment, the replacement candidate maintains a fail-safe refusal state (`POC_STOP_UNVERIFIED_REFUSED`).
-5. **Atomic Replacement & Rollback**: Writes new credentials to a `.new` temporary store and applies `os.replace` atomically. In the event of I/O failure, the previous credential and policy are fully restored.
+The local replacement candidate introduces `replace_credential()` and `WindowsStore.replace_credential_and_policy()` adhering to the following strict safety conditions:
+
+1. **Explicit Confirmation**: Requires explicit confirmation (`confirm_replace=True` / `--replace-expired`) in addition to an interactive masked terminal session.
+2. **Process Cessation Attestation (Fail-Closed Default)**:
+   - To prevent race conditions or concurrent child process access, replacement requires a callable `poc_stopped_attestation` returning `True`.
+   - *Current Status*: Because an external OS-level process cessation attestation interface is not yet linked in the CLI path, `poc_stopped_attestation` defaults to `None` and fails closed (`POC_STOP_UNVERIFIED_REFUSED`).
+3. **Revocation & Owner Verification**: Rejects replacement if the `revoked` marker exists or if the new policy owner does not match the existing stored policy owner.
+4. **Objective Cryptographic & Expiry Verification (`verify_payload` Alignment)**:
+   - In `verify_payload()`, timestamp expiry (`if expires <= now: raise Denied("Credential expired; store a new one")`) is evaluated after JSON schema, version, SID, owner, `policy_sha256`, and lifetime checks, and immediately before `validate_token()`.
+   - `replace_credential()` first calls `verify_payload(..., now=now, include_expiry=True)`:
+     - If no exception is raised, the credential is still active and replacement is refused (`Denied("Existing credential has not expired yet")` -> `CREDENTIAL_STILL_VALID`).
+     - If `Denied` is raised with any message other than `"Credential expired; store a new one"`, replacement is refused (`CREDENTIAL_UNVERIFIED`).
+   - Next, `replace_credential()` runs a second `verify_payload(..., now=created_at, include_expiry=True)` probe on a copy of the decrypted payload so that `validate_token()` and all bound fields (SID, owner, `policy_sha256`, timestamps) are cryptographically verified even when expired. Self-reported expiry alone never bypasses payload verification.
+5. **Two-File Staging, Post-Verification & Automatic Rollback (`WindowsStore.replace_credential_and_policy`)**:
+   - Because `WindowsStore.create()` enforces `CREATE_NEW` and refuses to overwrite existing files, `replace_credential_and_policy()` stages `.tmp` (new data) and `.bak` (existing `policy.json` and `credential.bin` bytes) under `STAGE_FILES` with protected ACLs.
+   - It then executes two `_replacer` (`os.replace`) operations (`policy.json.tmp -> policy.json`, `credential.bin.tmp -> credential.bin`), followed by byte-level comparison and the `verify_after` callback (which re-loads `policy.json` and decrypts/verifies the newly stored `credential.bin`).
+   - If the second `os.replace`, byte comparison, or `verify_after` fails, the exception handler automatically restores `policy.json.bak -> policy.json` and `credential.bin.bak -> credential.bin` via `_replacer`, cleans up staging files, and verifies that both files match the original bytes (`old_policy` and `old_cred`).
 
 ---
 
 ## 4. Verification & Testing Boundaries
 
-* **Synthetic Verification**: Offline validation confirmed that non-interactive invocations are rejected with `TERMINAL_REQUIRED` (exit code 2), and missing attestation interfaces safely halt with `POC_STOP_UNVERIFIED_REFUSED`.
+* **Synthetic 6-Path Verification (In-Memory Fake Store/DPAPI/ACL)**:
+  1. Missing explicit confirmation (`confirm_replace=False`) -> refused (`CONFIRMATION_REQUIRED`), original 2 files preserved.
+  2. Unverified or false process stop attestation (`None` / `False`) -> refused (`POC_STOP_UNVERIFIED_REFUSED`), original 2 files preserved.
+  3. Owner mismatch, `revoked` marker present, or tampered payload token -> refused, original 2 files preserved.
+  4. Unexpired existing credential (`now < expires_at`) -> refused (`Existing credential has not expired yet`), original 2 files preserved.
+  5. Expired valid credential with matching owner, valid SID/digest, and stop attestation -> replaced and post-verified successfully.
+  6. Failure injected on the 2nd `os.replace` (after `policy.json` was already replaced) and failure injected during post-replacement `verify_after` -> automatic `.bak` rollback restored both `policy.json` and `credential.bin` to exact original bytes.
 * **Strict Safety Boundaries Maintained**:
-  * Real DPAPI / credential store: untouched during analysis.
-  * Real PAT / tokens: never printed, logged, or handled by automated assistants.
-  * Live WebSocket / network connection: completely unverified and uninitiated.
+  * Real DPAPI / credential store / filesystem: untouched during synthetic testing.
+  * Real PAT / tokens: never input, read, printed, or logged.
+  * External process stop attestation & live WebSocket/network connection: unlinked and unexecuted.
+
